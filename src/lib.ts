@@ -40,7 +40,14 @@ export function hexToBytes(hex: string): Uint8Array {
 export function parseSecretKey(input: string): Uint8Array {
   const trimmed = input.trim();
   if (trimmed.startsWith("nsec1")) {
-    const decoded = nip19.decode(trimmed);
+    // bech32 decode errors embed the input verbatim ("Invalid checksum in nsec1..."),
+    // so never let the original error escape — it would put the key in the logs.
+    let decoded: ReturnType<typeof nip19.decode>;
+    try {
+      decoded = nip19.decode(trimmed);
+    } catch {
+      throw new Error("invalid nsec secret key");
+    }
     if (decoded.type !== "nsec") {
       throw new Error("expected nsec");
     }
@@ -202,4 +209,30 @@ export class SeenRing {
 
 export function pubkeyOf(secret: Uint8Array): string {
   return getPublicKey(secret);
+}
+
+/**
+ * A webhook attempt is only retried when the request never reached the server.
+ * A timeout/abort means the server may well have received and acted on it, so
+ * retrying would double-deliver; treat it as final, like any HTTP status.
+ */
+export function isRetryableWebhookError(err: unknown): boolean {
+  const name = (err as { name?: string } | null)?.name;
+  if (name === "TimeoutError" || name === "AbortError") return false;
+  return true;
+}
+
+export const BACKOFF_MIN_MS = 1000;
+export const BACKOFF_MAX_MS = 30_000;
+/** A connection is only "good" once it has stayed up this long. */
+export const BACKOFF_RESET_AFTER_MS = 60_000;
+
+/**
+ * Escalate unless the connection we just lost was healthy for a while. Resetting
+ * on every disconnect pins the delay at the minimum against a relay that accepts
+ * the socket and drops it immediately.
+ */
+export function nextBackoff(current: number, connectionUptimeMs: number): number {
+  if (connectionUptimeMs >= BACKOFF_RESET_AFTER_MS) return BACKOFF_MIN_MS;
+  return Math.min(current * 2, BACKOFF_MAX_MS);
 }

@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
 import type { Event } from "nostr-tools";
 import {
+  BACKOFF_MAX_MS,
+  BACKOFF_MIN_MS,
+  BACKOFF_RESET_AFTER_MS,
   FORUM_KINDS,
   SEEN_CAP,
   SeenRing,
@@ -10,6 +13,8 @@ import {
   channelId,
   isIgnoredAuthor,
   isMention,
+  isRetryableWebhookError,
+  nextBackoff,
   parseBool,
   parseChannelIds,
   parsePubkey,
@@ -241,5 +246,62 @@ describe("SeenRing", () => {
     expect(ring.add("0")).toBe(false);
     expect(ring.add("new")).toBe(true);
     expect(ring.add("0")).toBe(true);
+  });
+});
+
+describe("secret hygiene", () => {
+  test("a malformed nsec never appears in the error", () => {
+    const bad = `nsec1${"q".repeat(58)}zzzzz`;
+    expect(() => parseSecretKey(bad)).toThrow("invalid nsec secret key");
+    try {
+      parseSecretKey(bad);
+    } catch (err) {
+      const e = err as Error;
+      expect(e.message).not.toContain("nsec1");
+      expect(String(e.stack)).not.toContain(bad);
+    }
+  });
+
+  test("a malformed hex secret never appears in the error", () => {
+    try {
+      parseSecretKey("deadbeef");
+    } catch (err) {
+      expect((err as Error).message).not.toContain("deadbeef");
+    }
+  });
+});
+
+describe("isRetryableWebhookError", () => {
+  test("a timeout or abort is not retried", () => {
+    const timeout = new Error("timed out");
+    timeout.name = "TimeoutError";
+    expect(isRetryableWebhookError(timeout)).toBe(false);
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    expect(isRetryableWebhookError(abort)).toBe(false);
+  });
+
+  test("a connection failure is retried", () => {
+    expect(isRetryableWebhookError(new TypeError("fetch failed"))).toBe(true);
+  });
+});
+
+describe("nextBackoff", () => {
+  test("escalates while connections keep dying young", () => {
+    let b = BACKOFF_MIN_MS;
+    b = nextBackoff(b, 300);
+    expect(b).toBe(2000);
+    b = nextBackoff(b, 300);
+    expect(b).toBe(4000);
+  });
+
+  test("caps at the maximum", () => {
+    expect(nextBackoff(BACKOFF_MAX_MS, 0)).toBe(BACKOFF_MAX_MS);
+    expect(nextBackoff(20_000, 0)).toBe(BACKOFF_MAX_MS);
+  });
+
+  test("resets only after a connection that stayed up", () => {
+    expect(nextBackoff(16_000, BACKOFF_RESET_AFTER_MS)).toBe(BACKOFF_MIN_MS);
+    expect(nextBackoff(16_000, BACKOFF_RESET_AFTER_MS - 1)).toBe(BACKOFF_MAX_MS);
   });
 });

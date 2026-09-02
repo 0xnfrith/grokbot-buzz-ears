@@ -4,12 +4,15 @@ import { finalizeEvent } from "nostr-tools";
 import { Relay } from "nostr-tools/relay";
 import type { Event, EventTemplate } from "nostr-tools";
 import {
+  BACKOFF_MIN_MS,
   DEFAULT_WEBHOOK_TIMEOUT_MS,
   SeenRing,
   buildFilter,
   buildPayload,
   isIgnoredAuthor,
   isMention,
+  isRetryableWebhookError,
+  nextBackoff,
   parseBool,
   parseChannelIds,
   parsePubkey,
@@ -41,6 +44,7 @@ type Runtime = {
   lastEventAt: number | null;
   lastSeen: number;
   seen: SeenRing;
+  queue: Promise<void>;
 };
 
 function die(msg: string): never {
@@ -152,13 +156,14 @@ function startHealth(port: number, runtime: Runtime): void {
   });
 }
 
-async function postWebhook(cfg: Config, event: Event): Promise<void> {
+async function postWebhook(cfg: Config, event: Event): Promise<boolean> {
   const body = JSON.stringify(buildPayload(event, cfg.relayUrl));
   const headers = webhookHeaders(cfg.webhookBearer);
   const attempt = async (): Promise<{
     status: string;
     latency: number;
-    networkError: boolean;
+    ok: boolean;
+    retryable: boolean;
   }> => {
     const started = Date.now();
     try {
@@ -171,13 +176,16 @@ async function postWebhook(cfg: Config, event: Event): Promise<void> {
       return {
         status: String(res.status),
         latency: Date.now() - started,
-        networkError: false,
+        ok: res.ok,
+        retryable: false,
       };
-    } catch {
+    } catch (err) {
+      const retryable = isRetryableWebhookError(err);
       return {
-        status: "network_error",
+        status: retryable ? "network_error" : "timeout",
         latency: Date.now() - started,
-        networkError: true,
+        ok: false,
+        retryable,
       };
     }
   };
@@ -186,59 +194,77 @@ async function postWebhook(cfg: Config, event: Event): Promise<void> {
   console.log(
     `event=${event.id} status=${result.status} latency_ms=${result.latency}`,
   );
-  if (result.networkError) {
+  if (result.retryable) {
     result = await attempt();
     console.log(
       `event=${event.id} status=${result.status} latency_ms=${result.latency} retry=1`,
     );
   }
+  return result.ok;
+}
+
+function advanceLastSeen(cfg: Config, runtime: Runtime, createdAt: number): void {
+  if (createdAt > runtime.lastSeen) {
+    runtime.lastSeen = createdAt;
+    writeLastSeen(cfg.stateFile, runtime.lastSeen);
+  }
 }
 
 function handleEvent(cfg: Config, runtime: Runtime, event: Event): void {
   if (!runtime.seen.add(event.id)) return;
-  if (event.created_at > runtime.lastSeen) {
-    runtime.lastSeen = event.created_at;
-    writeLastSeen(cfg.stateFile, runtime.lastSeen);
-  }
   runtime.lastEventAt = event.created_at;
-  if (
-    isIgnoredAuthor(event, {
+  const forwardable =
+    !isIgnoredAuthor(event, {
       botPubkey: cfg.botPubkey,
       listenerPubkey: cfg.listenerPubkey,
-    })
-  ) {
-    return;
-  }
-  if (
-    !isMention(event, {
+    }) &&
+    isMention(event, {
       botMentionText: cfg.botMentionText,
       botPubkey: cfg.botPubkey,
-    })
-  ) {
+    });
+  if (!forwardable) {
+    // Nothing to deliver, so this event can never need replaying.
+    advanceLastSeen(cfg, runtime, event.created_at);
     return;
   }
-  void postWebhook(cfg, event);
+  // Serialize deliveries so `lastSeen` only ever moves past events we have
+  // actually handed to the webhook, and so a burst cannot fan out unbounded.
+  runtime.queue = runtime.queue
+    .then(async () => {
+      const delivered = await postWebhook(cfg, event);
+      if (delivered) advanceLastSeen(cfg, runtime, event.created_at);
+    })
+    .catch(() => {
+      // postWebhook already logged; never let the chain die.
+    });
 }
 
-async function listen(cfg: Config, runtime: Runtime): Promise<void> {
+async function listen(
+  cfg: Config,
+  runtime: Runtime,
+  register: (abort: () => void) => void,
+): Promise<number> {
   const relay = new Relay(cfg.wsUrl, { enablePing: true });
   const sign = async (evt: EventTemplate) =>
     finalizeEvent(evt, cfg.listenerSk);
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let connectedAt = 0;
     const done = (err?: unknown) => {
       if (settled) return;
       settled = true;
       runtime.connected = false;
+      const uptime = connectedAt ? Date.now() - connectedAt : 0;
       try {
         relay.close();
       } catch {
         // ignore
       }
       if (err) reject(err);
-      else resolve();
+      else resolve(uptime);
     };
+    register(() => done());
 
     relay.onauth = sign;
     relay.onclose = () => done();
@@ -247,6 +273,13 @@ async function listen(cfg: Config, runtime: Runtime): Promise<void> {
     };
 
     const subscribe = () => {
+      // `Relay.subscribe` fires the REQ through an async `send`, so on a socket
+      // that has already closed it rejects outside our promise chain and takes
+      // the process down. Never subscribe once this attempt is over.
+      if (settled || !relay.connected) {
+        done();
+        return;
+      }
       const filter = buildFilter({
         channelIds: cfg.channelIds,
         since: runtime.lastSeen,
@@ -273,6 +306,7 @@ async function listen(cfg: Config, runtime: Runtime): Promise<void> {
       .connect({ timeout: 10_000 })
       .then(async () => {
         runtime.connected = true;
+        connectedAt = Date.now();
         console.log("connected");
         await new Promise((r) => setTimeout(r, 150));
         try {
@@ -298,31 +332,48 @@ async function main(): Promise<void> {
     lastEventAt: null,
     lastSeen: readLastSeen(cfg.stateFile, now),
     seen: new SeenRing(),
+    queue: Promise.resolve(),
   };
   if (cfg.healthPort) startHealth(cfg.healthPort, runtime);
 
+  // nostr-tools rejects out-of-band on a racing socket close (see `subscribe`).
+  // The reconnect loop below is the recovery path, so log and carry on rather
+  // than letting the default handler kill a long-running forwarder.
+  process.on("unhandledRejection", (err) => {
+    console.error(
+      `unhandled rejection: ${err instanceof Error ? err.message : "error"}`,
+    );
+  });
+
   let stopping = false;
+  let abortListen: (() => void) | null = null;
   const stop = () => {
+    if (stopping) process.exit(0);
     stopping = true;
+    abortListen?.();
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 
-  let backoff = 1000;
+  let backoff = BACKOFF_MIN_MS;
   while (!stopping) {
     try {
-      await listen(cfg, runtime);
-      backoff = 1000;
+      const uptime = await listen(cfg, runtime, (abort) => {
+        abortListen = abort;
+      });
+      backoff = nextBackoff(backoff, uptime);
     } catch (err) {
       console.error(
         `disconnected: ${err instanceof Error ? err.message : "error"}`,
       );
+      backoff = nextBackoff(backoff, 0);
     }
+    abortListen = null;
     runtime.connected = false;
     if (stopping) break;
     await sleep(backoff);
-    backoff = Math.min(backoff * 2, 30_000);
   }
+  await runtime.queue;
 }
 
 if (import.meta.main) {

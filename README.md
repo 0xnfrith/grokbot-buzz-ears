@@ -33,7 +33,21 @@ All configuration is by environment variables. Nothing specific to any deploymen
    }
    ```
 
-4. Reconnects with exponential backoff (1s … 30s) on any close, resubscribing with `since` = last seen `created_at`. Optional `STATE_FILE` persists that timestamp across process restarts.
+4. Reconnects with exponential backoff (1s … 30s) on any close, resubscribing with `since` = last seen `created_at`. The backoff only resets after a connection that stayed up for a minute, so a relay that accepts the socket and drops it immediately is backed off rather than hammered once a second. Optional `STATE_FILE` persists that timestamp across process restarts.
+
+### Delivery semantics
+
+At-least-once. **The webhook must be idempotent on `event_id`.**
+
+`since` only advances past a mention once the webhook has accepted it (`2xx`), so a
+webhook that is down or erroring does not silently drop mentions. Two things can
+still deliver the same event twice, and both are cheap to absorb with an
+`event_id` check:
+
+- `since` is inclusive, and the in-process dedup ring does not survive a restart,
+  so any event sharing the last-seen second is re-sent on the next start.
+- The one retry fires only when the request never reached the server. A timeout is
+  *not* retried, precisely because the server may already have acted on it.
 
 The listener key should be a plain channel member, never an owner. Revoke it by removing it from the channel.
 
@@ -61,7 +75,7 @@ Requires [Bun](https://bun.sh). Tests: `bun test`.
 | `LISTENER_PRIVATE_KEY_FILE` | one of† | — | File containing that secret; see systemd below |
 | `WEBHOOK_URL` | yes | — | `POST` target |
 | `WEBHOOK_BEARER` | no | unset | Shared secret for the two webhook auth headers |
-| `WEBHOOK_TIMEOUT_MS` | no | `8000` | Per-attempt timeout; one retry on **network error only** (not 4xx) |
+| `WEBHOOK_TIMEOUT_MS` | no | `8000` | Per-attempt timeout; one retry on **network error only** (not on any HTTP status, not on timeout) |
 | `INCLUDE_FORUM_KINDS` | no | `false` | Also subscribe to kinds `45001` and `45003` |
 | `STATE_FILE` | no | unset | Path written with last-seen unix timestamp |
 | `HEALTH_PORT` | no | unset | If set, `GET /healthz` → `{"ok":true,"connected":bool,"last_event_at":…}` |
@@ -70,7 +84,7 @@ Requires [Bun](https://bun.sh). Tests: `bun test`.
 \* At least one of `BOT_MENTION_TEXT` / `BOT_PUBKEY`.  
 † At least one of `LISTENER_PRIVATE_KEY` / `LISTENER_PRIVATE_KEY_FILE` (`LISTENER_PRIVATE_KEY` wins if both are set).
 
-Logs one line per webhook attempt: event id, status code (or `network_error`), latency in ms. The bearer and the POST body are never logged.
+Logs one line per webhook attempt: event id, status code (or `network_error` / `timeout`), latency in ms. The bearer, the listener key and the POST body are never logged — including on a malformed key, where the bech32 decoder would otherwise echo the input.
 
 ## Webhook auth modes
 
