@@ -1,0 +1,18 @@
+{
+  "name": "buzz-webhook-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Forward Buzz/NIP-29 channel mentions to an HTTP webhook.",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.25.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.20"
+  }
+}
