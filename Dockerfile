@@ -1,5 +1,5 @@
 FROM oven/bun:1
-WORKDIR /app
+WORKDIR /opt/grokbot-ears
 
 COPY package.json bun.lock tsconfig.json ./
 COPY src ./src
