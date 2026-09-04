@@ -1,9 +1,9 @@
 {
-  "name": "buzz-webhook-bridge",
-  "version": "0.1.0",
+  "name": "grokbot-ears",
+  "version": "0.2.0",
   "private": true,
   "license": "MIT",
-  "description": "Forward Buzz/NIP-29 channel mentions to an HTTP webhook.",
+  "description": "GROKBOT's ears: discover Buzz/NIP-29 membership and forward #p mentions to an HTTP webhook.",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",

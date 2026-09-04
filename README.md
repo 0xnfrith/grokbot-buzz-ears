@@ -1,22 +1,32 @@
-# buzz-webhook-bridge
+# grokbot-ears
 
-A small forwarder that connects a Buzz relay (Nostr, NIP-29 groups) to any agent that can be woken by an HTTP webhook.
+GROKBOT's ears: a small forwarder that connects a Buzz relay (Nostr, NIP-29 groups) to any agent that can be woken by an HTTP webhook.
 
-It keeps one authenticated WebSocket open to the relay as a low-privilege *listener* identity, watches the channels you configure, and when a message mentions your bot it `POST`s the message as JSON to the bot's webhook. The bot answers back into the relay on its own, with its own identity — this process never publishes.
+It signs in with the **bot's own key** (the same identity the agent uses), discovers every channel that key is a member of, and when a message `#p`-mentions the bot it `POST`s the message as JSON to the webhook. The bot answers back into the relay on its own — this process never publishes.
+
+There is no `CHANNEL_IDS` list. New invites work without a config edit: membership is rediscovered on a cadence and on membership-notification events.
+
+The GitHub repository slug may still be `buzz-webhook-bridge` until an operator renames it. The process, package, unit, and install paths are `grokbot-ears`.
 
 All configuration is by environment variables. Nothing specific to any deployment lives in this repository.
 
 ## What it does
 
-1. Opens a WebSocket to `RELAY_URL`, authenticates with [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) using the listener key, and subscribes:
+1. Opens a WebSocket to `RELAY_URL` and authenticates with [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) using the bot key.
 
-   ```json
-   { "#h": ["<channel ids>"], "kinds": [9], "since": <now or last seen> }
-   ```
+2. Discovers channels the way Block's `buzz-acp` harness does:
+   - Query NIP-29 `kind:39002` (group members) with `#p` = our pubkey, then `kind:39000` metadata; skip `archived=true`.
+   - Subscribe to membership notifications (`kind:44100` added / `kind:44101` removed, `#p` = our pubkey). On join, subscribe immediately with `replay_since` = the membership timestamp so a mention in the same second is not missed.
+   - Re-query membership every `REDISCOVERY_INTERVAL_MS` (default 60s) as a safety net.
+   - One `REQ` per discovered channel id. Drop the sub when rediscovery or a leave notification shows we are no longer a member.
 
-2. Treats an event as a mention when its content contains `BOT_MENTION_TEXT` (case-insensitive) **or** it has a `p` tag equal to `BOT_PUBKEY`. Events authored by the bot or by the listener are ignored. Event ids are de-duplicated in memory (last 1000).
+3. Subscribes to **kind 9 only** by default (DM channels are kind 9 too). Forum kinds (`45001`, `45003`) and ACP stream kinds (`46010`, `40007`) stay off unless you opt in.
 
-3. On a mention, `POST`s JSON to `WEBHOOK_URL`:
+4. Wakes only when an event has a `p` tag equal to our pubkey. Events we authored are ignored. A text substring is **not** a wake signal (`BOT_MENTION_TEXT` is gone). Thread replies wake only if that reply `#p`-mentions us — there is no auto-wake for every reply in a prior thread. DMs: subscribe when we are a member; wake only on `#p`.
+
+   Anyone who `#p`-mentions the bot is forwarded. A future `RESPOND_TO` author allowlist may restrict that; it is not implemented here.
+
+5. On a mention, `POST`s JSON to `WEBHOOK_URL`:
 
    ```json
    {
@@ -33,7 +43,9 @@ All configuration is by environment variables. Nothing specific to any deploymen
    }
    ```
 
-4. Reconnects with exponential backoff (1s … 30s) on any close, resubscribing with `since` = last seen `created_at`. The backoff only resets after a connection that stayed up for a minute, so a relay that accepts the socket and drops it immediately is backed off rather than hammered once a second. Optional `STATE_FILE` persists that timestamp across process restarts.
+6. Reconnects with exponential backoff (1s … 30s) on any close, resubscribing with `since` = last seen `created_at`. The backoff only resets after a connection that stayed up for a minute, so a relay that accepts the socket and drops it immediately is backed off rather than hammered once a second. Optional `STATE_FILE` persists that timestamp across process restarts. Event ids are de-duplicated in memory (last 1000).
+
+The forwarder never holds the agent's webhook bearer unless you set `WEBHOOK_BEARER`; it may instead `POST` through an egress proxy that injects the secret.
 
 ### Delivery semantics
 
@@ -48,8 +60,6 @@ still deliver the same event twice, and both are cheap to absorb with an
   so any event sharing the last-seen second is re-sent on the next start.
 - The one retry fires only when the request never reached the server. A timeout is
   *not* retried, precisely because the server may already have acted on it.
-
-The listener key should be a plain channel member, never an owner. Revoke it by removing it from the channel.
 
 ## Run
 
@@ -68,23 +78,24 @@ Requires [Bun](https://bun.sh). Tests: `bun test`.
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `RELAY_URL` | yes | — | Relay WebSocket URL (`ws://` / `wss://`; `http`/`https` are upgraded) |
-| `CHANNEL_IDS` | yes | — | Comma-separated NIP-29 channel ids (`h` tags) |
-| `BOT_MENTION_TEXT` | one of\* | — | Substring that counts as a mention, e.g. `@Bot Name` |
-| `BOT_PUBKEY` | one of\* | — | Bot pubkey (hex or `npub`) matched against `p` tags |
-| `LISTENER_PRIVATE_KEY` | one of† | — | Listener secret (hex or `nsec`) |
-| `LISTENER_PRIVATE_KEY_FILE` | one of† | — | File containing that secret; see systemd below |
+| `BOT_PRIVATE_KEY_FILE` | one of\* | — | File containing the bot secret (hex or `nsec`); see systemd below |
+| `BOT_PRIVATE_KEY` | one of\* | — | Bot secret inline (hex or `nsec`). Prefer the file form. |
+| `BOT_PUBKEY` | no | derived | Hex or `npub`. If set, must match the key. Required in the sense that a pubkey (explicit or derived) is always used as the `#p` wake signal. |
 | `WEBHOOK_URL` | yes | — | `POST` target |
 | `WEBHOOK_BEARER` | no | unset | Shared secret for the two webhook auth headers |
 | `WEBHOOK_TIMEOUT_MS` | no | `8000` | Per-attempt timeout; one retry on **network error only** (not on any HTTP status, not on timeout) |
+| `REDISCOVERY_INTERVAL_MS` | no | `60000` | How often to re-query kind:39002 membership |
 | `INCLUDE_FORUM_KINDS` | no | `false` | Also subscribe to kinds `45001` and `45003` |
+| `INCLUDE_ACP_STREAM_KINDS` | no | `false` | Also subscribe to ACP stream kinds `46010` and `40007` |
 | `STATE_FILE` | no | unset | Path written with last-seen unix timestamp |
 | `HEALTH_PORT` | no | unset | If set, `GET /healthz` → `{"ok":true,"connected":bool,"last_event_at":…}` |
 | `CREDENTIALS_DIRECTORY` | no | unset | Set by systemd `LoadCredential=`; used to resolve a relative key file |
 
-\* At least one of `BOT_MENTION_TEXT` / `BOT_PUBKEY`.  
-† At least one of `LISTENER_PRIVATE_KEY` / `LISTENER_PRIVATE_KEY_FILE` (`LISTENER_PRIVATE_KEY` wins if both are set).
+\* At least one of `BOT_PRIVATE_KEY_FILE` / `BOT_PRIVATE_KEY`. For one release, `LISTENER_PRIVATE_KEY_FILE` / `LISTENER_PRIVATE_KEY` are still accepted and log a deprecation warning. `BOT_*` wins when both generations are set. Inline `BOT_PRIVATE_KEY` wins over `BOT_PRIVATE_KEY_FILE`.
 
-Logs one line per webhook attempt: event id, status code (or `network_error` / `timeout`), latency in ms. The bearer, the listener key and the POST body are never logged — including on a malformed key, where the bech32 decoder would otherwise echo the input.
+`CHANNEL_IDS` and `BOT_MENTION_TEXT` are ignored (a warning is logged if they are set).
+
+Logs one line per webhook attempt: event id, status code (or `network_error` / `timeout`), latency in ms. The bearer, the bot key and the POST body are never logged — including on a malformed key, where the bech32 decoder would otherwise echo the input.
 
 ## Webhook auth modes
 
@@ -102,24 +113,26 @@ Use this when the forwarder is allowed to hold the webhook secret.
 
 ## systemd
 
-Store the listener secret outside the unit file. `LoadCredential=` copies it into `$CREDENTIALS_DIRECTORY` at runtime (mode `0400`, not visible in `/proc`).
+Place the bot key via a root-only file and systemd `LoadCredential=` (copied into `$CREDENTIALS_DIRECTORY` at runtime, mode `0400`, not visible in `/proc`). Use placeholders only; never put key material in the unit or in git.
 
-`/etc/credstore/listener_key` — the nsec or hex secret, one line.
+`/etc/credstore/grokbot_ears_key` — the nsec or hex secret, one line.
 
-`/etc/buzz-webhook-bridge.env` — everything else (`RELAY_URL`, `CHANNEL_IDS`, `WEBHOOK_URL`, …). Do not put the listener secret here.
+`/etc/grokbot-ears.env` — everything else (`RELAY_URL`, `WEBHOOK_URL`, …). Do not put the bot secret here.
+
+Unit file `grokbot-ears.service`:
 
 ```ini
 [Unit]
-Description=buzz webhook bridge
+Description=grokbot-ears
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/buzz-webhook-bridge
-EnvironmentFile=/etc/buzz-webhook-bridge.env
-LoadCredential=listener_key:/etc/credstore/listener_key
-Environment=LISTENER_PRIVATE_KEY_FILE=listener_key
+WorkingDirectory=/opt/grokbot-ears
+EnvironmentFile=/etc/grokbot-ears.env
+LoadCredential=grokbot_ears_key:/etc/credstore/grokbot_ears_key
+Environment=BOT_PRIVATE_KEY_FILE=grokbot_ears_key
 ExecStart=/usr/local/bin/bun run start
 Restart=on-failure
 RestartSec=5
@@ -129,16 +142,20 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-A relative `LISTENER_PRIVATE_KEY_FILE` is resolved against `$CREDENTIALS_DIRECTORY` when that variable is set, so `listener_key` reads `$CREDENTIALS_DIRECTORY/listener_key`. Absolute paths are used as-is.
+A relative `BOT_PRIVATE_KEY_FILE` is resolved against `$CREDENTIALS_DIRECTORY` when that variable is set, so `grokbot_ears_key` reads `$CREDENTIALS_DIRECTORY/grokbot_ears_key`. Absolute paths are used as-is.
 
 ## Docker
 
 ```bash
-docker build -t buzz-webhook-bridge .
-docker run --rm --env-file .env buzz-webhook-bridge
+docker build -t grokbot-ears .
+docker run --rm --env-file .env grokbot-ears
 ```
 
-Pass `LISTENER_PRIVATE_KEY` in the env file, or mount a key file and set `LISTENER_PRIVATE_KEY_FILE`.
+Mount a key file and set `BOT_PRIVATE_KEY_FILE`, or pass `BOT_PRIVATE_KEY` in the env file (not recommended).
+
+## Cutover
+
+Cutover is an operator/deploy concern. After a live test of the new process, do a hard flip: start `grokbot-ears` and stop the old forwarder unit. Leave the old unit **stopped (not deleted) for one day** so it can be started again if you need to roll back. Channel lists in the old env file are unused; membership is discovered from the relay.
 
 ## License
 

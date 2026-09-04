@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "buzz-webhook-bridge",
+      "name": "grokbot-ears",
       "dependencies": {
         "nostr-tools": "^2.25.1",
       },
